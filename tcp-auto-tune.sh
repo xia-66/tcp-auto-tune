@@ -5,18 +5,28 @@ set -e
 # ==========================================================
 # Auto TCP Tuning Script for Proxy Node
 # Debian 11/12, Ubuntu 20.04+
-# Auto bandwidth test, auto RTT test, auto BBR/fq tuning
+#
+# Features:
+# - Auto bandwidth test
+# - Auto RTT test
+# - Manual adjustment for bandwidth / RTT / upload limit
+# - Enable BBR + fq
+# - Auto TCP buffer tuning
+# - MTU probing
+# - Increase file limits
+# - Optional tc upload limit
 # ==========================================================
 
 SYSCTL_CONF="/etc/sysctl.d/99-tcp-tuning.conf"
 BACKUP_DIR="/root/tcp-tuning-backup"
 TC_SERVICE="/etc/systemd/system/tc-upload-limit.service"
 
-# 是否自动设置上传限速
-# 1 = 开启，0 = 关闭
+# 默认是否启用上传限速
+# 1 = 启用
+# 0 = 不启用
 AUTO_TC_LIMIT=1
 
-# 上传限速比例，默认实测上传的 95%
+# 默认上传限速比例
 TC_LIMIT_PERCENT=95
 
 GREEN="\033[32m"
@@ -45,7 +55,9 @@ check_root() {
 
 check_system() {
     info "检测系统信息..."
+
     echo "Kernel: $(uname -r)"
+
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
         echo "OS: $PRETTY_NAME"
@@ -131,7 +143,7 @@ detect_iface() {
     fi
 
     if [[ -z "$IFACE" ]]; then
-        error "无法自动识别默认网卡"
+        error "无法自动识别默认出口网卡"
         exit 1
     fi
 
@@ -140,7 +152,7 @@ detect_iface() {
 
 auto_speedtest() {
     info "开始自动测速，这一步可能需要 30~90 秒..."
-    warn "测速会消耗一定流量，并且结果会受 speedtest 节点影响。"
+    warn "测速会消耗一定流量，并且结果可能受 speedtest 节点影响。"
 
     SPEED_JSON=$(mktemp)
 
@@ -148,35 +160,39 @@ auto_speedtest() {
         DOWN_MBPS=$(python3 - "$SPEED_JSON" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f:
-    d=json.load(f)
+    d = json.load(f)
 print(max(1, int(d.get("download", 0) / 1000000)))
 PY
 )
+
         UP_MBPS=$(python3 - "$SPEED_JSON" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f:
-    d=json.load(f)
+    d = json.load(f)
 print(max(1, int(d.get("upload", 0) / 1000000)))
 PY
 )
+
         SPEED_PING=$(python3 - "$SPEED_JSON" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f:
-    d=json.load(f)
+    d = json.load(f)
 print(int(float(d.get("ping", 0)) + 0.5))
 PY
 )
+
         SPEED_SERVER=$(python3 - "$SPEED_JSON" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f:
-    d=json.load(f)
-server=d.get("server", {})
-sponsor=server.get("sponsor", "unknown")
-name=server.get("name", "unknown")
-country=server.get("country", "unknown")
+    d = json.load(f)
+server = d.get("server", {})
+sponsor = server.get("sponsor", "unknown")
+name = server.get("name", "unknown")
+country = server.get("country", "unknown")
 print(f"{sponsor} / {name} / {country}")
 PY
 )
+
         rm -f "$SPEED_JSON"
 
         info "测速节点: $SPEED_SERVER"
@@ -185,7 +201,9 @@ PY
         info "测速节点 Ping: ${SPEED_PING} ms"
     else
         rm -f "$SPEED_JSON"
-        warn "自动测速失败，将使用保守默认值：下载 100M / 上传 50M"
+
+        warn "自动测速失败，将使用保守默认值：下载 100M / 上传 50M / RTT 150ms"
+
         DOWN_MBPS=100
         UP_MBPS=50
         SPEED_PING=150
@@ -208,21 +226,22 @@ ping_one() {
 auto_rtt_test() {
     info "开始自动 RTT 测试..."
 
-    # 代理节点常见目标：
-    # 如果你的节点服务中国大陆用户，223.5.5.5 / 119.29.29.29 / 114.114.114.114 更有参考价值
-    # 同时加入 1.1.1.1 / 8.8.8.8 作为全球可达参考
+    # 代理节点常用 RTT 目标
+    # 已移除 114.114.114.114，因为部分海外 VPS 无法正常访问
     TARGETS=(
-        "223.5.5.5"
-        "119.29.29.29"
-        "114.114.114.114"
-        "1.1.1.1"
-        "8.8.8.8"
+        "223.5.5.5"       # AliDNS
+        "119.29.29.29"    # DNSPod
+        "180.76.76.76"    # Baidu DNS
+        "1.1.1.1"         # Cloudflare
+        "8.8.8.8"         # Google
+        "9.9.9.9"         # Quad9
     )
 
     RTT_LIST=()
 
     for target in "${TARGETS[@]}"; do
         rtt=$(ping_one "$target")
+
         if [[ -n "$rtt" ]]; then
             info "Ping $target: ${rtt} ms"
             RTT_LIST+=("$rtt")
@@ -233,18 +252,18 @@ auto_rtt_test() {
 
     if [[ "${#RTT_LIST[@]}" -eq 0 ]]; then
         warn "所有 RTT 测试失败，使用测速节点 Ping 或默认 RTT"
+
         if [[ "$SPEED_PING" =~ ^[0-9]+$ ]] && [[ "$SPEED_PING" -gt 0 ]]; then
             RTT_MS="$SPEED_PING"
         else
             RTT_MS=150
         fi
     else
-        # 代理节点通常更关心到主要用户方向的 RTT。
-        # 这里取可用 RTT 的较大值，避免 buffer 估算过小。
+        # 代理节点通常需要考虑较高 RTT 方向，避免 buffer 估算过小
         RTT_MS=$(printf "%s\n" "${RTT_LIST[@]}" | sort -n | tail -1)
     fi
 
-    # 如果 RTT 太小，但测速节点 ping 明显更大，则取更大的那个
+    # 如果 speedtest ping 更大，则取更大的值
     if [[ "$SPEED_PING" =~ ^[0-9]+$ ]] && [[ "$SPEED_PING" -gt "$RTT_MS" ]]; then
         RTT_MS="$SPEED_PING"
     fi
@@ -258,13 +277,112 @@ auto_rtt_test() {
         RTT_MS=500
     fi
 
-    info "最终用于计算的 RTT: ${RTT_MS} ms"
+    info "最终自动检测 RTT: ${RTT_MS} ms"
+}
+
+manual_adjust() {
+    echo
+    echo "================ 检测结果确认 ================"
+    echo
+    echo "自动检测结果："
+    echo "下载带宽: ${DOWN_MBPS} Mbps"
+    echo "上传带宽: ${UP_MBPS} Mbps"
+    echo "RTT: ${RTT_MS} ms"
+    echo
+
+    warn "自动测速结果可能受 speedtest 节点、线路波动、限速策略影响。"
+    warn "如果与你的机器标称带宽不一致，建议手动修正。"
+    echo
+
+    read -rp "是否手动调整下载带宽、上传带宽或 RTT？[y/N]: " ADJUST_RESULT
+
+    if [[ "$ADJUST_RESULT" =~ ^[Yy]$ ]]; then
+        echo
+
+        read -rp "请输入下载带宽 Mbps，当前 ${DOWN_MBPS}，直接回车保持不变: " INPUT_DOWN
+        if [[ -n "$INPUT_DOWN" ]]; then
+            if [[ "$INPUT_DOWN" =~ ^[0-9]+$ ]] && [[ "$INPUT_DOWN" -gt 0 ]]; then
+                DOWN_MBPS="$INPUT_DOWN"
+            else
+                warn "下载带宽输入无效，保持原值: ${DOWN_MBPS} Mbps"
+            fi
+        fi
+
+        read -rp "请输入上传带宽 Mbps，当前 ${UP_MBPS}，直接回车保持不变: " INPUT_UP
+        if [[ -n "$INPUT_UP" ]]; then
+            if [[ "$INPUT_UP" =~ ^[0-9]+$ ]] && [[ "$INPUT_UP" -gt 0 ]]; then
+                UP_MBPS="$INPUT_UP"
+            else
+                warn "上传带宽输入无效，保持原值: ${UP_MBPS} Mbps"
+            fi
+        fi
+
+        read -rp "请输入 RTT ms，当前 ${RTT_MS}，直接回车保持不变: " INPUT_RTT
+        if [[ -n "$INPUT_RTT" ]]; then
+            if [[ "$INPUT_RTT" =~ ^[0-9]+$ ]] && [[ "$INPUT_RTT" -gt 0 ]]; then
+                RTT_MS="$INPUT_RTT"
+            else
+                warn "RTT 输入无效，保持原值: ${RTT_MS} ms"
+            fi
+        fi
+    fi
+
+    echo
+    echo "最终用于 TCP 调优的参数："
+    echo "下载带宽: ${DOWN_MBPS} Mbps"
+    echo "上传带宽: ${UP_MBPS} Mbps"
+    echo "RTT: ${RTT_MS} ms"
+    echo
+
+    read -rp "是否启用上传限速降低延迟？默认启用 [Y/n]: " INPUT_TC_ENABLE
+
+    if [[ "$INPUT_TC_ENABLE" =~ ^[Nn]$ ]]; then
+        AUTO_TC_LIMIT=0
+        TC_LIMIT=""
+        info "已关闭上传限速"
+    else
+        AUTO_TC_LIMIT=1
+
+        DEFAULT_TC_LIMIT=$((UP_MBPS * TC_LIMIT_PERCENT / 100))
+
+        if [[ "$DEFAULT_TC_LIMIT" -lt 1 ]]; then
+            DEFAULT_TC_LIMIT=1
+        fi
+
+        echo
+        echo "上传限速建议："
+        echo "1. 更低延迟：上传带宽的 90%"
+        echo "2. 均衡推荐：上传带宽的 95%"
+        echo "3. 尽量跑满：上传带宽的 97%~98%"
+        echo
+        echo "当前上传带宽: ${UP_MBPS} Mbps"
+        echo "默认上传限速: ${DEFAULT_TC_LIMIT} Mbps"
+        echo
+
+        read -rp "请输入上传限速 Mbps，直接回车使用默认 ${DEFAULT_TC_LIMIT}: " INPUT_TC_LIMIT
+
+        if [[ -n "$INPUT_TC_LIMIT" ]]; then
+            if [[ "$INPUT_TC_LIMIT" =~ ^[0-9]+$ ]] && [[ "$INPUT_TC_LIMIT" -gt 0 ]]; then
+                TC_LIMIT="$INPUT_TC_LIMIT"
+            else
+                warn "上传限速输入无效，使用默认值: ${DEFAULT_TC_LIMIT} Mbps"
+                TC_LIMIT="$DEFAULT_TC_LIMIT"
+            fi
+        else
+            TC_LIMIT="$DEFAULT_TC_LIMIT"
+        fi
+
+        info "最终上传限速: ${TC_LIMIT} mbit"
+    fi
+
+    echo
 }
 
 calc_buffer() {
     info "根据带宽和 RTT 自动计算 TCP buffer..."
 
     local max_mbps
+
     if [[ "$DOWN_MBPS" -ge "$UP_MBPS" ]]; then
         max_mbps="$DOWN_MBPS"
     else
@@ -326,7 +444,7 @@ write_sysctl_config() {
 # Auto TCP tuning for proxy node
 # Generated by tcp-auto-tune.sh
 #
-# Detected bandwidth:
+# Bandwidth:
 #   Download: ${DOWN_MBPS} Mbps
 #   Upload:   ${UP_MBPS} Mbps
 # RTT used: ${RTT_MS} ms
@@ -391,7 +509,7 @@ EOF
 
 setup_tc_limit() {
     if [[ "$AUTO_TC_LIMIT" -ne 1 ]]; then
-        warn "未启用自动上传限速"
+        warn "未启用上传限速"
         return
     fi
 
@@ -400,7 +518,9 @@ setup_tc_limit() {
         return
     fi
 
-    TC_LIMIT=$((UP_MBPS * TC_LIMIT_PERCENT / 100))
+    if [[ -z "$TC_LIMIT" ]]; then
+        TC_LIMIT=$((UP_MBPS * TC_LIMIT_PERCENT / 100))
+    fi
 
     if [[ "$TC_LIMIT" -lt 1 ]]; then
         TC_LIMIT=1
@@ -408,8 +528,7 @@ setup_tc_limit() {
 
     info "设置上传限速，降低 bufferbloat..."
     info "网卡: $IFACE"
-    info "实测上传: ${UP_MBPS} Mbps"
-    info "限速比例: ${TC_LIMIT_PERCENT}%"
+    info "上传带宽: ${UP_MBPS} Mbps"
     info "tc 限速: ${TC_LIMIT} mbit"
 
     tc qdisc replace dev "$IFACE" root fq maxrate "${TC_LIMIT}mbit"
@@ -441,7 +560,7 @@ show_result() {
     echo "================ TCP 自动调优完成 ================"
     echo
 
-    echo "检测结果："
+    echo "最终参数："
     echo "下载带宽: ${DOWN_MBPS} Mbps"
     echo "上传带宽: ${UP_MBPS} Mbps"
     echo "RTT: ${RTT_MS} ms"
@@ -449,7 +568,11 @@ show_result() {
     echo "TCP buffer max: ${BUFFER_MB} MB"
 
     if [[ "$AUTO_TC_LIMIT" -eq 1 ]]; then
-        echo "上传限速: ${TC_LIMIT} mbit"
+        if [[ -n "$TC_LIMIT" ]]; then
+            echo "上传限速: ${TC_LIMIT} mbit"
+        else
+            echo "上传限速: 已启用但未设置"
+        fi
     else
         echo "上传限速: 未启用"
     fi
@@ -483,7 +606,7 @@ show_result() {
     echo
 
     warn "建议重启代理服务，例如 xray、sing-box、hysteria、trojan、ss-server 等。"
-    warn "如果发现上传速度被限制得过低，可以关闭 tc 限速或调整限速值。"
+    warn "如果发现上传速度被限制得过低，可以重新运行脚本调整上传限速。"
 }
 
 main() {
@@ -495,8 +618,9 @@ main() {
 
     echo
     warn "脚本将自动测速并应用代理节点 TCP 调优。"
-    warn "默认会把上传限速设置为实测上传的 ${TC_LIMIT_PERCENT}%，用于降低延迟和 bufferbloat。"
+    warn "测速完成后可以手动修正下载带宽、上传带宽、RTT 和上传限速。"
     echo
+
     read -rp "是否继续？[y/N]: " CONFIRM
 
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
@@ -507,6 +631,7 @@ main() {
     backup_config
     auto_speedtest
     auto_rtt_test
+    manual_adjust
     calc_buffer
     write_sysctl_config
     apply_sysctl

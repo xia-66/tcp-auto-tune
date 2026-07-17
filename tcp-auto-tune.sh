@@ -18,7 +18,7 @@ set -e
 # ==========================================================
 
 SYSCTL_CONF="/etc/sysctl.d/99-tcp-tuning.conf"
-BACKUP_DIR="/root/tcp-tuning-backup"
+BACKUP_DIR="/etc/sysctl.d/tcp-tuning-backup"
 TC_SERVICE="/etc/systemd/system/tc-upload-limit.service"
 
 # 默认是否启用上传限速
